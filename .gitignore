@@ -1,0 +1,16 @@
+*.cmd
+*.o
+*.mod
+*.mod.c
+*.symvers
+*.order
+*.ko
+
+# Python bytecode, from the userspace tools under contrib/
+__pycache__/
+*.py[cod]
+
+# omen-f1: a separate project that happens to live here for now. Not part of
+# this repo -- it is moving out to its own tree.
+/f1project.md
+/contrib/omen-f1/

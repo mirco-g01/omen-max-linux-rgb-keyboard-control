@@ -1,0 +1,13 @@
+[Unit]
+Description=Alt + brightness keys control the OMEN keyboard backlight
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/omen-fx-brightnessd
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

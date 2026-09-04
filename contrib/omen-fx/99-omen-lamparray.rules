@@ -1,0 +1,23 @@
+# HP OMEN MAX per-key RGB keyboard (HID LampArray, Usage Page 0x59).
+#
+# The keyboard exposes five hidraw nodes; four of them carry keystrokes and
+# must stay root-only. Only interface 4 is the LampArray control channel, so
+# the interface number has to be part of the match.
+#
+# This cannot be written with ATTRS{}: udev requires every ATTRS{} key in a
+# rule to match on one single parent, and idVendor/idProduct live on the USB
+# device while bInterfaceNumber lives on the USB interface below it -- so such
+# a rule is unsatisfiable and silently never fires. 60-persistent-hidraw.rules
+# runs earlier and imports the usb_id builtin, so match its properties instead.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", \
+  ENV{ID_USB_VENDOR_ID}=="0d62", ENV{ID_USB_MODEL_ID}=="54bf", \
+  ENV{ID_USB_INTERFACE_NUM}=="04", \
+  GROUP="input", MODE="0660"
+
+# The keyboard-backlight LED. Normally nothing writes this file directly --
+# PowerDevil or UPower do, as root, and going through them is what keeps the
+# desktop's brightness slider in step. The rule is for the case where neither
+# is running (a bare compositor, a TTY), so omen-fx-brightness has a last
+# resort that does not need root. Only the brightness attribute is opened up.
+SUBSYSTEM=="leds", KERNEL=="omen::kbd_backlight", \
+  RUN+="/bin/sh -c 'chgrp input /sys/class/leds/%k/brightness && chmod 0664 /sys/class/leds/%k/brightness'"

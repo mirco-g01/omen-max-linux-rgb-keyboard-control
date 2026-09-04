@@ -1,0 +1,335 @@
+# omen-fx -- lighting for HP OMEN laptops: light bar + per-key keyboard
+#
+# There are two lit surfaces, and they are completely different hardware:
+#
+#   bar    the 4-segment light bar, via the omen_rgb_keyboard driver's sysfs
+#          (what the driver calls "keyboard zones" is really the bar)
+#   keys   the 120-lamp per-key backlight, a standard HID LampArray on
+#          /dev/hidraw*, nothing to do with the kernel driver
+#
+# Every effect is a function of position and time, sampled on whichever surface
+# it plays on -- so the same "center_out" pulse spreads across four zones on the
+# bar and across 120 keys on the keyboard, in step.
+#
+# Reload after editing:  omen-fx reload
+# Try an effect:         omen-fx play notify --target keys
+# See everything:        omen-fx demo
+
+[daemon]
+sysfs = "/sys/devices/platform/omen-rgb-keyboard/rgb_zones"
+socket = "/run/omen-fx/control.sock"
+# Brightness used by any effect that does not set its own. The bar is often
+# kept dim or off, and an alert has to be visible anyway; the previous
+# brightness is restored when the effect ends. Set to -1 to inherit instead.
+#
+# This is an effect's level *relative* to the machine's: the user's keyboard
+# backlight slider (omen::kbd_backlight) multiplies it, on both surfaces. The
+# daemon only ever reads that slider, so moving it takes effect at once and
+# nothing here ever moves it back.
+effect_brightness = 100
+queue_limit = 4        # effects waiting in line; the oldest is dropped past this
+hold_timeout = 60      # seconds before a held effect gives up on its release
+# Where an overlay plays when neither the effect nor the request says:
+# "bar", "keys" or "both".
+default_target = "both"
+# Milliseconds spent fading from an alert's last frame back to the default
+# look. Cutting straight there is a visible snap -- black to near-white in one
+# frame -- so this is on by default. 0 disables it; an effect may set its own.
+fade_back_ms = 300
+# How wide a window each light-bar segment averages the effect over, in
+# segments either side of its centre. The bar has four cells against the
+# keyboard's twenty columns, so it has to summarise; this says how gently.
+#   1.0  crisper, more contrast between segments, harder hand-over
+#   1.5  the default
+#   2.0  softest; the four segments blend into one another
+bar_blend = 1.5
+
+# ---------------------------------------------------------------------------
+# Dimming when you walk away
+# ---------------------------------------------------------------------------
+# A *rendering* level, not your brightness setting: the desktop's keyboard
+# backlight slider is left exactly where you put it, so nothing goes stale and
+# one keypress brings the lights straight back to it.
+#
+# Inactivity is read from /dev/input rather than from the desktop, because no
+# idle signal is common to KDE, GNOME, sway and a bare TTY -- and because the
+# answer stays right when the screen is locked or a game owns the compositor.
+# Only the time of an event is taken; nothing decodes what was pressed.
+#
+# The GUI writes these to /etc/omen-fx/settings.toml (tab Sistema), which wins
+# over what is here.
+[idle]
+enabled = false
+timeout = 60        # seconds of no keyboard or mouse before dimming
+brightness = 20     # percent of the normal level once dimmed; 0 is off
+fade_ms = 1500      # how long the dim takes. Waking up is always immediate.
+
+[base]
+# What to go back to once an effect ends.
+#   "capture" -- read the lighting just before the first effect starts (default)
+#   "pinned"  -- always return to a fixed look; set it with: omen-fx base pin
+mode = "capture"
+apply_on_start = false
+
+# ---------------------------------------------------------------------------
+# Default look, per surface
+# ---------------------------------------------------------------------------
+# [base.keys] and [base.bar] each hold a normal effect spec -- static or
+# animated -- that the surface shows whenever no overlay is on top of it.
+# Leave a table out entirely and omen-fx does not touch that surface at all.
+#
+# The GUI edits these under the "Predefinito" tab and saves them to
+# /etc/omen-fx/base.toml, which layers over what is written here -- the same
+# arrangement as effects.toml, so this hand-written file is never rewritten.
+#
+# That "leave it out" case matters for the keyboard: without [base.keys] the
+# daemon never takes the LampArray, so the keyboard keeps its own firmware
+# lighting. The moment it *does* take it, the firmware starts mirroring the
+# keyboard onto the light bar -- see [base.bar] below.
+
+[base.keys]
+kind = "gradient"              # static ramp across the machine
+colors = ["001A40", "2A0A60"]
+# Relative to the user's own level, not absolute: everything written to either
+# surface is scaled again by the desktop's "keyboard backlight" slider (the
+# omen::kbd_backlight LED, i.e. rgb_zones/brightness). Leave this at 100 and
+# the slider covers the full range; lower it only to keep the default look
+# dimmer than an alert that asks for 100.
+brightness = 100
+
+# Animated alternatives -- swap one in and run: omen-fx reload
+#   kind = "wave"     speed = 2   spread = 1.0    # slow hue sweep, endless
+#   kind = "breathe"  color = "0040FF"  cycles = 0
+#   kind = "solid"    color = "FFFFFF"
+
+[base.bar]
+# "mirror" is special: it means "let the firmware copy the keyboard onto the
+# bar". It costs no WMI writes at all, so the keyboard keeps the full 30 Hz,
+# and the two surfaces match for free.
+kind = "mirror"
+
+# To drive the bar independently instead, put a real effect here:
+#   kind = "gradient"  colors = ["001A40", "2A0A60"]
+# Be aware of the cost: while the keyboard is animating, the firmware mirror
+# overwrites the bar on every frame, so the bar has to be rewritten every frame
+# too. A bar write is ~30 ms against the keyboard's ~12 ms, which takes the
+# combined rate from 30 Hz down to about 24 Hz. Still smooth, just not free.
+
+
+# ---------------------------------------------------------------------------
+# Effects
+# ---------------------------------------------------------------------------
+# The alert effects below are all "center_out": a pulse born at the middle of
+# the machine and running outward. On the bar it reaches zones 2+3 first and
+# 1+4 last; on the keyboard the same wavefront crosses all 120 keys.
+#
+# Between alert types ONLY the colour and the speed change:
+#
+#   color        hex, e.g. "FF1500"
+#   speed        1 (slow) .. 10 (fast) -- how fast the front crosses a zone
+#   cycles       how many times the effect repeats. 0 means "never stop",
+#                which is what a default profile usually wants.
+#   duration_ms  the total run length. Given, it wins over speed: the cycle is
+#                stretched or squeezed so exactly `cycles` of them fit, so the
+#                motion is rescaled rather than cut off part way.
+#
+# Both knobs work on every kind. `times` and `steps` are accepted as aliases
+# of `cycles` for the kinds that historically used those names.
+#
+# Smoothness -- the two knobs that decide whether the hand-over from one LED to
+# the next reads as a step or as a glide:
+#
+#   smoothness   0..1, spatial: how wide the wavefront is, i.e. how much a point
+#                glows while the front is still on its neighbour. 0 hard edge,
+#                1 broad soft wash
+#   gamma        1..3, corrects the eye's non-linear response (2.2 is right for
+#                most LEDs); without it a linear fade looks top-heavy
+#   tail         0..1, how much a point keeps as the front moves past it (0.45)
+#
+# There is no "resolution" knob any more: effects are continuous functions of
+# time now, sampled once per frame, so they keep their real speed whatever the
+# hardware manages to deliver.
+#
+# Fine tuning, rarely needed:
+#   off_color   background colour ("000000")
+#   colors      list of colours, one per cycle, instead of a single "color"
+#   brightness  overrides daemon.effect_brightness for this effect
+#   priority    higher interrupts lower (default 50)
+#   target        "bar", "keys" or "both" -- where this effect plays.
+#                 Omitted, daemon.default_target decides.
+#   fade_back_ms  how long the return to the default look takes when THIS
+#                 effect ends; 0 cuts straight there. It is per effect --
+#                 setting it on one alert does nothing for the others. Left
+#                 out, daemon.fade_back_ms above applies, which is the knob to
+#                 change if you want the same return everywhere.
+#
+# Effect kinds: solid, gradient, blink, breathe, center_out, sweep, wipe, wave,
+# rainbow, alternate, sparkle, progress, ripple. See the README.
+#
+# "static", "pulse", "knightrider" and "centerout" are accepted as aliases of
+# solid, breathe, sweep and center_out -- the same effects under older names.
+#
+# Not every knob applies to every kind: `smoothness`, `gamma` and `tail`
+# describe a travelling wavefront, so only center_out, sweep and ripple read
+# them, and a static kind like solid or gradient reads no timing knob at all.
+# The GUI hides what the chosen kind ignores.
+
+[effects.notify]
+kind = "center_out"
+color = "00A8FF"       # blue -- ordinary notification
+speed = 7
+cycles = 1
+priority = 50
+
+[effects.notify-urgent]
+kind = "center_out"
+color = "FF1500"       # red -- critical notification
+speed = 10
+cycles = 3
+priority = 70
+
+[effects.notify-low]
+kind = "center_out"
+color = "2060FF"       # dim blue -- low priority
+speed = 4
+cycles = 1
+priority = 40
+target = "bar"         # low priority: keep it off the keyboard
+
+[effects.message]
+kind = "center_out"
+color = "00FF88"       # green -- for a per-app rule
+speed = 8
+cycles = 1
+priority = 55
+
+# Password prompt. hold = the pulse keeps repeating until the PAM hook
+# releases it (or the timeout in the trigger rule expires).
+[effects.auth]
+kind = "center_out"
+color = "FF7A00"       # orange -- howdy is looking at you
+speed = 5
+cycles = 1
+priority = 80
+target = "both"        # unmissable: the whole machine pulses
+
+# Shown while the password prompt is up, after howdy has given up. Calm and
+# slow on purpose: the orange above means "hold still, the camera is looking",
+# this one means "type".
+[effects.auth-password]
+kind = "center_out"
+color = "6040FF"
+speed = 3
+cycles = 1
+priority = 80
+
+[effects.auth-ok]
+kind = "center_out"
+color = "00FF40"       # green -- authenticated
+speed = 9
+cycles = 1
+priority = 85
+
+[effects.auth-fail]
+kind = "center_out"
+color = "FF0000"
+speed = 10
+cycles = 2
+priority = 85
+
+[effects.alert]
+kind = "center_out"
+color = "FF0000"
+speed = 10
+cycles = 3
+priority = 90
+
+[effects.ok]
+kind = "center_out"
+color = "00FF40"
+speed = 8
+cycles = 1
+
+[effects.party]
+kind = "center_out"
+colors = ["FF0000", "FFA500", "FFFF00", "00FF40", "00A8FF", "8000FF"]
+speed = 9
+cycles = 4
+
+
+# ---------------------------------------------------------------------------
+# Triggers
+# ---------------------------------------------------------------------------
+# Each [[trigger]] maps an event to an effect. Optional filters: app, summary,
+# body (substring, case-insensitive), urgency (0 low / 1 normal / 2 critical),
+# service, user. The most specific matching rule wins, so the order here does
+# not matter.
+#
+# Events: "notification" (from omen-fx-notifyd), "auth.start" / "auth.end"
+# (from the PAM hook), plus anything you fire yourself with
+#   omen-fx trigger EVENT --app ... --summary ...
+
+# A trigger may override the effect's own target, so the same effect can go to
+# different surfaces depending on what fired it:
+#   [[trigger]]
+#   event = "notification"
+#   app = "*telegram*"
+#   effect = "message"
+#   target = "keys"
+
+[[trigger]]
+event = "notification"
+effect = "notify"
+
+[[trigger]]
+event = "notification"
+urgency = 2
+effect = "notify-urgent"
+
+[[trigger]]
+event = "notification"
+urgency = 0
+effect = "notify-low"
+
+# Example of an app-specific rule -- adjust the app name to taste.
+# [[trigger]]
+# event = "notification"
+# app = "*telegram*"
+# effect = "message"
+
+# Password prompt (sudo, polkit, screen unlock -- whatever you wired the PAM
+# hook into). "hold" keeps the effect on screen under the key "auth" until the
+# matching auth.end arrives, or until timeout seconds have passed.
+[[trigger]]
+event = "auth.start"
+effect = "auth"
+hold = "auth"
+timeout = 45
+
+# Authenticated: drop whichever auth effect is on screen and flash green.
+[[trigger]]
+event = "auth.end"
+release = "auth"
+effect = "auth-ok"
+
+# The face scan did not succeed. Fired from a hook placed straight after the
+# "sufficient" howdy line, which the PAM stack only reaches on failure.
+[[trigger]]
+event = "auth.fail"
+release = "auth"
+effect = "auth-fail"
+
+# ...and immediately after, the password prompt takes over. Held under the same
+# "auth" key so that auth.end clears it too.
+[[trigger]]
+event = "auth.password"
+effect = "auth-password"
+hold = "auth"
+timeout = 60
+
+# Only the graphical polkit prompts, if you want them to look different:
+# [[trigger]]
+# event = "auth.start"
+# service = "polkit-1"
+# effect = "auth-sweep"
+# hold = "auth"

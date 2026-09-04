@@ -1,0 +1,29 @@
+[Unit]
+Description=OMEN light bar effect daemon
+Documentation=file:/usr/local/share/doc/omen-fx/README.md
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/lib/omen-fx/omen-fxd --config /etc/omen-fx/config.toml
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=omen-fx
+RuntimeDirectoryMode=0755
+StateDirectory=omen-fx
+
+# It only needs to write sysfs and its own socket.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER
+
+[Install]
+WantedBy=multi-user.target

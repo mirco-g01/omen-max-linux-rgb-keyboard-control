@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OMEN Light Bar Effects
+Comment=Edit the light bar alert effects and preview them live
+Exec=/usr/local/bin/omen-fx-gui
+Icon=preferences-desktop-color
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=omen;rgb;led;light;bar;

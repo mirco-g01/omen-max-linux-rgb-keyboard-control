@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""PAM hook: light the bar while an authentication prompt is waiting.
+
+Wired into /etc/pam.d/sudo (and friends) through pam_exec, so it runs as root
+on every authentication attempt. It must be fast and it must never fail: PAM
+runs it in-line, and a non-zero exit or a hang here would be felt on every
+single sudo. Hence: no imports beyond the stdlib basics, a sub-second socket
+timeout, and exit 0 no matter what.
+
+    argv[1]  start   authentication began -- a prompt is now waiting
+             fail    placed after a "sufficient" face-recognition module, so
+                     it only runs when that module did NOT succeed: howdy gave
+                     up and a password is about to be asked for
+             stop    authentication succeeded
+"""
+
+import json
+import os
+import socket
+import sys
+
+SOCKET_PATH = os.environ.get("OMEN_FX_SOCKET", "/run/omen-fx/control.sock")
+TIMEOUT = 0.4
+
+
+# A failed face scan is two things at once: the failure itself, and the start
+# of the password phase. They are separate events so each gets its own rule.
+EVENTS = {
+    "start": ("auth.start",),
+    "fail": ("auth.fail", "auth.password"),
+    "stop": ("auth.end",),
+}
+
+
+def main() -> int:
+    phase = sys.argv[1] if len(sys.argv) > 1 else "start"
+    events = EVENTS.get(phase, EVENTS["start"])
+    service = os.environ.get("PAM_SERVICE", "unknown")
+    user = os.environ.get("PAM_USER", "")
+    try:
+        for event in events:
+            request = {"cmd": "trigger", "event": event,
+                       "service": service, "user": user}
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(TIMEOUT)
+                sock.connect(SOCKET_PATH)
+                sock.sendall((json.dumps(request) + "\n").encode())
+                sock.shutdown(socket.SHUT_WR)
+                sock.recv(256)
+    except Exception:
+        pass  # the light bar is never a reason to fail authentication
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

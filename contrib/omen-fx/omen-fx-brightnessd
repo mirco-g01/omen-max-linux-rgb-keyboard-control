@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Alt + the brightness keys drive the keyboard backlight, with press-and-hold.
+
+Read straight from evdev, and deliberately so -- a desktop shortcut cannot do
+this job on any desktop, for two reasons that were measured rather than
+guessed:
+
+  * The compositor keeps the brightness keys. On Plasma 6.7 a brightness key
+    reaches a global shortcut only when Shift is held; bound to
+    `Alt+Monitor Brightness Up` a shortcut registers cleanly, reports itself as
+    the only claimant, and then does nothing at all when pressed -- it does not
+    fire, and the screen does not move either. Meta, Ctrl, Ctrl+Alt and
+    Meta+Alt behave the same. Other desktops draw the line elsewhere; none of
+    them promise to hand these keys over.
+  * The key does not auto-repeat. The keyboard's consumer-control interface
+    sends one press and one release however long it is held, so no shortcut --
+    the desktop's own included -- can ramp. The repeat has to be made here.
+
+Reading the device also means this works the same on KDE, GNOME, sway or a bare
+TTY, which a shortcut written into any one desktop's config would not.
+
+What it does *not* do: grab the device. Plain brightness presses go on to the
+compositor and keep changing the screen exactly as before; we act only when Alt
+is held, which is the case the compositor was throwing away.
+
+Privacy: only the consumer-control device (media and brightness keys) is read
+as a stream. Modifier state is polled with EVIOCGKEY at the moment a brightness
+key arrives, so the typing keyboard's events are never read at all.
+"""
+
+from __future__ import annotations
+
+import array
+import fcntl
+import glob
+import os
+import select
+import struct
+import subprocess
+import sys
+import time
+
+EV_KEY = 0x01
+KEY_BRIGHTNESSDOWN = 224
+KEY_BRIGHTNESSUP = 225
+KEY_LEFTSHIFT, KEY_RIGHTSHIFT = 42, 54
+KEY_LEFTALT, KEY_RIGHTALT = 56, 100
+KEY_MAX = 0x2FF
+
+EVENT_SIZE = struct.calcsize("qqHHi")
+STEP_BIN = os.environ.get("OMEN_FX_BRIGHTNESS", "/usr/local/bin/omen-fx-brightness")
+
+HOLD_DELAY_S = 0.35     # before a held key starts ramping
+HOLD_INTERVAL_S = 0.13  # PowerDevil ignores sets much closer than 0.1 s
+HOLD_MAX_S = 30.0       # a release we never saw must not ramp forever
+
+COARSE, FINE = 5, 1
+
+
+def _key_bits(path: str) -> list[int]:
+    try:
+        with open(os.path.join(path, "capabilities/key")) as fh:
+            return [int(w, 16) for w in fh.read().split()][::-1]
+    except OSError:
+        return []
+
+
+def _declares(words: list[int], code: int) -> bool:
+    word, bit = divmod(code, 64)
+    return word < len(words) and bool((words[word] >> bit) & 1)
+
+
+def find_devices() -> tuple[list[str], list[str]]:
+    """(devices sending brightness keys, devices holding modifier state).
+
+    By capability rather than by event number, which moves around across
+    reboots and replugs. The Video Bus is skipped: it mirrors the same presses
+    and would double every step.
+    """
+    brightness, modifiers = [], []
+    for sysfs in sorted(glob.glob("/sys/class/input/event*/device")):
+        node = "/dev/input/" + os.path.basename(os.path.dirname(sysfs))
+        try:
+            with open(os.path.join(sysfs, "name")) as fh:
+                name = fh.read().strip()
+        except OSError:
+            continue
+        words = _key_bits(sysfs)
+        if _declares(words, KEY_BRIGHTNESSUP) and "Video Bus" not in name:
+            brightness.append(node)
+        if _declares(words, KEY_LEFTALT):
+            modifiers.append(node)
+    return brightness, modifiers
+
+
+class Modifiers:
+    """Current state of Alt and Shift, asked for only when it matters."""
+
+    def __init__(self, nodes: list[str]):
+        self.fds = []
+        for node in nodes:
+            try:
+                self.fds.append(os.open(node, os.O_RDONLY | os.O_NONBLOCK))
+            except OSError as exc:
+                print(f"cannot watch modifiers on {node}: {exc}", file=sys.stderr)
+
+    def _state(self) -> array.array:
+        merged = array.array("B", [0] * ((KEY_MAX + 7) // 8))
+        buf = array.array("B", [0] * len(merged))
+        request = 0x80000000 | (len(buf) << 16) | (ord("E") << 8) | 0x18  # EVIOCGKEY
+        for fd in self.fds:
+            try:
+                fcntl.ioctl(fd, request, buf)
+            except OSError:
+                continue
+            for i, byte in enumerate(buf):
+                merged[i] |= byte
+        return merged
+
+    def read(self) -> tuple[bool, bool]:
+        state = self._state()
+        def down(code: int) -> bool:
+            return bool(state[code // 8] >> (code % 8) & 1)
+        alt = down(KEY_LEFTALT) or down(KEY_RIGHTALT)
+        shift = down(KEY_LEFTSHIFT) or down(KEY_RIGHTSHIFT)
+        return alt, shift
+
+
+def apply_step(delta: int) -> None:
+    try:
+        subprocess.run([STEP_BIN, f"{delta:+d}"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=3)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"step failed: {exc}", file=sys.stderr)
+
+
+def main() -> int:
+    brightness_nodes, modifier_nodes = find_devices()
+    if not brightness_nodes:
+        print("no device sends brightness keys", file=sys.stderr)
+        return 1
+
+    streams = {}
+    for node in brightness_nodes:
+        try:
+            streams[open(node, "rb", buffering=0)] = node
+        except OSError as exc:
+            print(f"cannot read {node}: {exc}", file=sys.stderr)
+    if not streams:
+        return 1
+
+    modifiers = Modifiers(modifier_nodes)
+    print(f"watching {', '.join(streams.values())}; "
+          f"modifiers from {', '.join(modifier_nodes) or 'nothing'}", flush=True)
+
+    held_code: int | None = None
+    held_delta = 0
+    next_step = 0.0
+    started = 0.0
+    # Some machines expose the same physical key on two nodes (here the AT
+    # keyboard also *declares* the brightness keys). One press arriving twice
+    # would step twice, so a repeat of the same code within a few tens of
+    # milliseconds is the same press.
+    last_press: dict[int, float] = {}
+
+    while True:
+        timeout = max(0.0, next_step - time.monotonic()) if held_code else None
+        ready, _, _ = select.select(list(streams), [], [], timeout)
+
+        for stream in ready:
+            try:
+                data = stream.read(EVENT_SIZE)
+            except OSError as exc:
+                # The keyboard went away (suspend, replug). Let systemd start
+                # us again rather than limping on with a dead descriptor.
+                print(f"{streams[stream]} disappeared: {exc}", file=sys.stderr)
+                return 1
+            if not data or len(data) < EVENT_SIZE:
+                continue
+            _sec, _usec, etype, code, value = struct.unpack("qqHHi", data)
+            if etype != EV_KEY or code not in (KEY_BRIGHTNESSUP, KEY_BRIGHTNESSDOWN):
+                continue
+
+            if value == 0:                      # release
+                if code == held_code:
+                    held_code = None
+                continue
+            if value != 1:                      # a repeat we did not ask for
+                continue
+
+            now = time.monotonic()
+            if now - last_press.get(code, 0.0) < 0.05:
+                continue                        # the same press on a second node
+            last_press[code] = now
+
+            alt, shift = modifiers.read()
+            if not alt:
+                continue                        # KWin's business: the screen
+            step = FINE if shift else COARSE
+            held_delta = step if code == KEY_BRIGHTNESSUP else -step
+            held_code = code
+            started = now
+            next_step = started + HOLD_DELAY_S
+            apply_step(held_delta)
+
+        if held_code and time.monotonic() >= next_step:
+            if time.monotonic() - started > HOLD_MAX_S:
+                held_code = None
+                continue
+            apply_step(held_delta)
+            next_step = time.monotonic() + HOLD_INTERVAL_S
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

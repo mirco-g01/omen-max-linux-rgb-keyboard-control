@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Change the keyboard backlight: a signed step (+5, -1) or an absolute level.
+#
+# Three ways to write it, tried in order, because the right one depends on the
+# desktop and all three end up at the same LED:
+#
+#   PowerDevil   KDE only, and the only one that shows the on-screen display.
+#   UPower       every desktop that has a keyboard-brightness slider reads it,
+#                so writing here is what keeps that slider from going stale.
+#   sysfs        no desktop at all (a bare compositor, a TTY). Needs the udev
+#                rule this project ships, or root.
+#
+# Writing sysfs while UPower is running is what leaves the desktop's slider
+# showing a value the hardware no longer has, so it is deliberately last.
+set -euo pipefail
+
+LED=/sys/class/leds/omen::kbd_backlight/brightness
+PD_DEST=org.kde.Solid.PowerManagement
+PD_OBJ=/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl
+PD_IFACE=org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl
+UP_DEST=org.freedesktop.UPower
+UP_OBJ=/org/freedesktop/UPower/KbdBacklight
+UP_IFACE=org.freedesktop.UPower.KbdBacklight
+
+# Under key repeat the shortcut fires faster than the backend applies a change,
+# and PowerDevil drops a set that lands while the previous one is still going.
+# Reading the live value every time would therefore lose steps and a held key
+# would crawl, so a target written less than a second ago is trusted over the
+# hardware: presses accumulate, and a dropped write is carried into the next.
+STATE="${XDG_RUNTIME_DIR:-/tmp}/omen-fx-brightness.target"
+FRESH_S=1
+
+usage() { echo "usage: ${0##*/} <+N | -N | N>   (percent)" >&2; exit 1; }
+arg="${1:-}"
+[[ "$arg" =~ ^[+-]?[0-9]+$ ]] || usage
+
+num() { tr -dc '0-9' <<<"$1"; }
+
+backend=""
+current=""
+if gdbus call --session --dest "$PD_DEST" --object-path "$PD_OBJ" \
+     --method "$PD_IFACE.keyboardBrightness" >/dev/null 2>&1; then
+  backend=powerdevil
+  current=$(num "$(gdbus call --session --dest "$PD_DEST" --object-path "$PD_OBJ" \
+                     --method "$PD_IFACE.keyboardBrightness")")
+elif gdbus call --system --dest "$UP_DEST" --object-path "$UP_OBJ" \
+       --method "$UP_IFACE.GetBrightness" >/dev/null 2>&1; then
+  backend=upower
+  current=$(num "$(gdbus call --system --dest "$UP_DEST" --object-path "$UP_OBJ" \
+                     --method "$UP_IFACE.GetBrightness")")
+elif [[ -r "$LED" ]]; then
+  backend=sysfs
+  current=$(<"$LED")
+else
+  echo "no way to reach the keyboard backlight (no PowerDevil, no UPower, no $LED)" >&2
+  exit 1
+fi
+
+if [[ "$arg" =~ ^[+-] ]]; then
+  base=""
+  if [[ -f "$STATE" ]] && (( $(date +%s) - $(stat -c %Y "$STATE") <= FRESH_S )); then
+    base=$(<"$STATE")
+  fi
+  [[ "$base" =~ ^[0-9]+$ ]] || base=$current
+  target=$(( base + arg ))
+else
+  base=$current
+  target=$arg
+fi
+
+(( target < 0 )) && target=0
+(( target > 100 )) && target=100
+printf '%s' "$target" > "$STATE"
+
+case "$backend" in
+  powerdevil) gdbus call --session --dest "$PD_DEST" --object-path "$PD_OBJ" \
+                --method "$PD_IFACE.setKeyboardBrightness" "$target" >/dev/null ;;
+  upower)     gdbus call --system  --dest "$UP_DEST" --object-path "$UP_OBJ" \
+                --method "$UP_IFACE.SetBrightness" "$target" >/dev/null ;;
+  sysfs)      printf '%s\n' "$target" > "$LED" ;;
+esac
+
+LOG="$HOME/.cache/omen-fx-brightness.log"
+[[ -f "$LOG" ]] && printf '%s %-4s base=%-3s -> %-3s (%s)\n' \
+  "$(date +%H:%M:%S.%3N)" "$arg" "$base" "$target" "$backend" >> "$LOG"
+
+echo "$base -> $target"
