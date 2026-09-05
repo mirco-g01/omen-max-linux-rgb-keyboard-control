@@ -564,6 +564,13 @@ Issues and pull requests are welcome, especially from other OMEN MAX owners: a
 second machine in the tested table would be worth a lot. Anything touching
 fans, power limits or thermal profiles belongs in another project, not here.
 
+## Support
+
+If this saved you the trouble of writing it yourself, you can support the work
+via [GitHub Sponsors](https://github.com/sponsors/mirco-g01) or
+[Ko-fi](https://ko-fi.com/mircog01). Entirely optional — issues and PRs are
+just as welcome either way.
+
 ## Contact
 
 **mircog59@gmail.com** — write to me directly, in English or Italian.
