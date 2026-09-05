@@ -76,8 +76,9 @@ setting is left exactly where you put it.</td>
 
 ## Tested on
 
-One machine, listed in full, because "OMEN 16" covers a dozen different
-keyboards and only this one has been verified:
+**One machine: my own personal laptop, and nothing else.** Everything in this
+repository was written and verified there. "OMEN 16" covers a dozen different
+keyboards, so the machine is listed in full rather than by marketing name:
 
 ```
 OS:         Arch Linux x86_64
@@ -92,12 +93,15 @@ EC:         38.46
 Keyboard:   0d62:54bf Darfon "HP Gaming Keyboard II"
             HID LampArray, 120 lamps, 342 x 125 mm, 30 Hz update cap
 Light bar:  4 WMI zones, through omen_rgb_keyboard 1.5
+Suspend:    s2idle, with acpi_x86.sleep_no_lps0=1 — see Troubleshooting,
+            "Fn Keys and Backlight Die After Suspend"
 ```
 
-That is the whole tested list. Other OMEN MAX machines are likely to work —
-the processor and graphics differ between them and none of this touches either
-— but likely is not tested, so they are not listed. If yours works, or does
-not, an issue saying so is welcome and the table will grow.
+That is the whole tested list: one laptop, one BIOS, one kernel. Other OMEN MAX
+machines are likely to work — the processor and graphics differ between them and
+none of this touches either — but *likely* is not *tested*, so they are not
+listed. If yours works, or does not, say so and the table will grow: an issue,
+or the address below.
 
 The BIOS and EC versions are there because the light bar goes through WMI, and
 WMI is firmware: if an update ever breaks it, that is the line to check first.
@@ -559,6 +563,25 @@ more hardware than this is.
 Issues and pull requests are welcome, especially from other OMEN MAX owners: a
 second machine in the tested table would be worth a lot. Anything touching
 fans, power limits or thermal profiles belongs in another project, not here.
+
+## Contact
+
+**mircog59@gmail.com** — write to me directly, in English or Italian.
+
+Two things in particular are worth an email:
+
+* **Something does not work.** Say which OMEN model you have, the output of
+  `cat /sys/class/dmi/id/product_name`, your kernel version, and what happens.
+  If it is the driver, add `dmesg | grep omen`.
+* **Everything works.** This is genuinely as useful, and much rarer. All of the
+  above has been verified on exactly one laptop, so a second machine confirming
+  it turns "probably fine" into something I can actually put in the table above
+  — with your model listed, if you are happy for it to be.
+
+Opening an issue does the same job and leaves the answer where the next person
+will find it, so prefer that when the problem is not specific to you. Use the
+address when you would rather not, or when there is something to work through
+back and forth.
 
 ## Disclaimer
 

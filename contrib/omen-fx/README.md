@@ -13,10 +13,12 @@ you, a script, a Makefile ─▶ omen-fx CLI          ─┘
 
 ## What this runs on
 
-An **HP OMEN MAX 16**, and nothing else is aimed at. Developed and tested on a
-16-ah0xxx; the variations between MAX models are processor and graphics, which
-none of this touches, so other MAX machines should be fine. If yours is not,
-that is a bug worth reporting.
+An **HP OMEN MAX 16**, and nothing else is aimed at. Developed and tested on
+exactly one machine — my own personal 16-ah0xxx — and nowhere else. The
+variations between MAX models are processor and graphics, which none of this
+touches, so other MAX machines should be fine; but that is reasoning, not
+testing. If yours is not fine, that is a bug worth reporting, and the contact
+address is in the top-level README.
 
 Two pieces of hardware, and they fail independently:
 
