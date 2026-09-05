@@ -462,6 +462,37 @@ lsmod | grep omen_rgb_keyboard
 ls -la /sys/devices/platform/omen-rgb-keyboard/rgb_zones/
 ```
 
+### Fn Keys and Backlight Die After Suspend
+
+If, after resuming, the keyboard backlight is dead **and** F2/F3/F4 stop
+controlling brightness (on KDE they open System Settings instead), while every
+other key still works — and a reboot does not fix it, only a full power off —
+you are hitting the Modern Standby handover, not a driver bug.
+
+The short version: entering s2idle the kernel calls the ACPI LPS0 `_DSM`, which
+tells the HP firmware to hand those three keys to host software that exists on
+Windows and not here. The fix is a kernel parameter:
+
+```bash
+# add to your kernel command line, then reboot
+acpi_x86.sleep_no_lps0=1
+
+# verify
+cat /sys/module/acpi_x86/parameters/sleep_no_lps0   # must print Y
+```
+
+To confirm the diagnosis on your own machine first:
+
+```bash
+sudo scripts/omen-kbd-suspend-test trial
+sudo scripts/omen-kbd-suspend-test ladder
+```
+
+The full write-up — what the firmware actually does, what the workaround costs,
+how to keep the backlight off during sleep, and a list of dead ends so nobody
+repeats them — is in
+[docs/modern-standby-fn-keys.md](docs/modern-standby-fn-keys.md).
+
 ### Colors Not Changing
 - Ensure you're using the correct hex format (6 characters, uppercase)
 - Check that brightness is not set to 0

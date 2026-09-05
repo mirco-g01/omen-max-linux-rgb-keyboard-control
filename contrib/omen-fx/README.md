@@ -739,6 +739,15 @@ omen-fx status
   normally means the devices are missing, not a permission problem.
 * **experiment without touching the hardware** — `omen-fxd --dry-run -v` logs
   every write it would make instead of making it.
+* **the keyboard stays lit while the machine sleeps** — you are running with
+  `acpi_x86.sleep_no_lps0=1`, the workaround for the Fn row dying after suspend
+  (see [../../docs/modern-standby-fn-keys.md](../../docs/modern-standby-fn-keys.md)).
+  That parameter also stops the EC being told the screen went off, so it never
+  turns the backlight off. Install the hook that does it instead:
+  `sudo install -m755 systemd/omen-fx-blank-on-suspend.sh
+  /usr/lib/systemd/system-sleep/omen-fx-blank-on-suspend.sh`. Writing `0` to
+  `/sys/class/leds/omen::kbd_backlight/brightness` will not do it — that is a
+  colour scaler, not an off switch.
 
 ## Layout
 
@@ -761,6 +770,7 @@ omen-fx status
 | `omen-fx-pam` | PAM hook, kept deliberately tiny |
 | `pam-hook.py` | patches/unpatches `/etc/pam.d/*` |
 | `99-omen-lamparray.rules` | hands out *only* the LampArray hidraw node to group `input` |
+| `systemd/omen-fx-blank-on-suspend.sh` | turns the keyboard off while asleep, for setups running `acpi_x86.sleep_no_lps0=1` |
 
 Config files, in increasing precedence: `/etc/omen-fx/config.toml` (yours, hand
 written, never rewritten by a program), then `/etc/omen-fx/effects.toml` (the

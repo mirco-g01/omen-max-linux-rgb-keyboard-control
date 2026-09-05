@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Check whether suspend breaks the Fn row on an OMEN keyboard, and where.
+
+See docs/modern-standby-fn-keys.md for what this is about.
+
+    sudo omen-kbd-suspend-test check          just report the current state
+    sudo omen-kbd-suspend-test trial [secs]   check, suspend, check again
+    sudo omen-kbd-suspend-test ladder         walk the suspend sequence by depth
+
+The state is read from the scancode the keyboard actually emits for F2:
+
+    working  0x000c0070  KEY_BRIGHTNESSDOWN on the consumer-control interface
+    broken   0x00070068  F13 on the boot-keyboard interface
+
+'trial' uses rtcwake, so it resumes by itself. 'ladder' uses /sys/power/pm_test
+(needs CONFIG_PM_DEBUG) to stop the suspend sequence at increasing depth and
+check after each one; the first level that breaks the keyboard identifies the
+layer responsible. A level that passes costs nothing, so the walk continues.
+
+Once the keyboard is broken, only a full power cycle brings it back -- a reboot
+is not enough -- so a run that ends in 'broken' is the end of testing for now.
+
+pm_test is always put back to 'none' on the way out, including on Ctrl+C:
+leaving it set would turn every later suspend into a no-op.
+"""
+
+import os
+import re
+import select
+import struct
+import subprocess
+import sys
+import time
+
+EV_KEY_FMT = "llHHi"
+EV_SIZE = struct.calcsize(EV_KEY_FMT)
+EV_MSC, MSC_SCAN = 0x04, 0x04
+
+WORKING_SCAN = 0x000C0070
+BROKEN_SCAN = 0x00070068
+
+PM_TEST = "/sys/power/pm_test"
+PM_STATE = "/sys/power/state"
+LEVELS = ["freezer", "devices", "platform", "processors", "core", "none"]
+LEVEL_HELP = {
+    "freezer": "freezes tasks only, no device suspend",
+    "devices": "+ suspends and resumes devices (this is where USB suspend lives)",
+    "platform": "+ ACPI/platform callbacks (this is where the LPS0 _DSM lives)",
+    "processors": "+ takes the non-boot CPUs down",
+    "core": "+ suspends the core",
+    "none": "a real, complete suspend",
+}
+
+# Substring of the input device name to listen on. Override with OMEN_KBD_NAME
+# if your keyboard reports itself differently.
+KBD_NAME = os.environ.get("OMEN_KBD_NAME", "Gaming Keyboard")
+
+
+def keyboard_event_nodes():
+    nodes = []
+    for block in open("/proc/bus/input/devices").read().split("\n\n"):
+        if KBD_NAME in block:
+            nodes += ["/dev/input/" + ev for ev in re.findall(r"(event\d+)", block)]
+    return sorted(set(nodes))
+
+
+def classify(timeout=12.0):
+    """Wait for an F2 press and report 'working', 'broken' or None."""
+    fds = {}
+    for path in keyboard_event_nodes():
+        try:
+            fds[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = path
+        except OSError:
+            pass
+    if not fds:
+        print(f"   no readable input device matching {KBD_NAME!r}")
+        return None
+
+    print(f"   press F2 (waiting {timeout:.0f}s)...", flush=True)
+    verdict, end = None, time.time() + timeout
+    try:
+        while time.time() < end and verdict is None:
+            ready, _, _ = select.select(list(fds), [], [], max(0.0, end - time.time()))
+            for fd in ready:
+                try:
+                    data = os.read(fd, EV_SIZE * 64)
+                except OSError:
+                    continue
+                for i in range(0, len(data) - EV_SIZE + 1, EV_SIZE):
+                    _, _, etype, code, value = struct.unpack(EV_KEY_FMT, data[i:i + EV_SIZE])
+                    if etype == EV_MSC and code == MSC_SCAN:
+                        if value == WORKING_SCAN:
+                            verdict = "working"
+                        elif value == BROKEN_SCAN:
+                            verdict = "broken"
+    finally:
+        for fd in fds:
+            os.close(fd)
+    return verdict
+
+
+def write(path, value):
+    with open(path, "w") as fh:
+        fh.write(value)
+
+
+def require_root():
+    if os.geteuid() != 0:
+        sys.exit("needs root")
+
+
+def cmd_check():
+    print("== current state ==")
+    state = classify()
+    print(f"   -> {state or 'undetermined (no F2 seen)'}")
+    return 0 if state == "working" else 1
+
+
+def cmd_trial(secs):
+    print("== before ==")
+    before = classify()
+    print(f"   -> {before}")
+    if before is None:
+        sys.exit("   no F2 seen: aborting without suspending.")
+    if before == "broken":
+        sys.exit("   already broken: power the machine off and on before testing, "
+                 "otherwise the run tells you nothing.")
+
+    print(f"\n== suspending for {secs}s (rtcwake) ==", flush=True)
+    res = subprocess.run(["rtcwake", "-m", "mem", "-s", str(secs)],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.exit(f"   rtcwake failed: {res.stderr.strip()}")
+    time.sleep(3)
+
+    print("\n== after ==")
+    after = classify()
+    print(f"   -> {after}")
+
+    print("\n== result ==")
+    if after == "broken":
+        print("   the suspend broke the Fn row. A power cycle is needed.")
+        return 1
+    if after == "working":
+        print("   the keyboard survived the suspend.")
+        return 0
+    print("   undetermined: no F2 seen after resume.")
+    return 2
+
+
+def cmd_ladder():
+    if not os.path.exists(PM_TEST):
+        sys.exit("pm_test missing: needs a kernel built with CONFIG_PM_DEBUG.")
+
+    print("== initial state ==")
+    state = classify()
+    print(f"   -> {state}")
+    if state != "working":
+        sys.exit("   must start from a working keyboard: power off and on first.")
+
+    broke_at = None
+    try:
+        for level in LEVELS:
+            print(f"\n== level '{level}' -- {LEVEL_HELP[level]} ==", flush=True)
+            write(PM_TEST, level)
+            try:
+                write(PM_STATE, "mem")
+            except OSError as exc:
+                print(f"   suspend failed: {exc}")
+                continue
+            time.sleep(3)
+            state = classify()
+            print(f"   -> {state}")
+            if state == "broken":
+                broke_at = level
+                break
+            if state is None:
+                print("   undetermined: no F2 seen, stopping here.")
+                break
+    finally:
+        try:
+            write(PM_TEST, "none")
+            print("\n(pm_test restored to 'none')")
+        except OSError as exc:
+            print(f"\nWARNING: could not restore pm_test to 'none': {exc}")
+            print("Do it by hand: echo none | sudo tee /sys/power/pm_test")
+
+    print("\n== result ==")
+    if broke_at is None:
+        print("   no level broke the keyboard.")
+        return 0
+    print(f"   broken at '{broke_at}'.")
+    i = LEVELS.index(broke_at)
+    if i:
+        print(f"   '{LEVELS[i-1]}' passed, so the cause is what '{broke_at}' "
+              f"adds to it.")
+    if broke_at == "platform":
+        print("   That is the ACPI layer, where the LPS0 _DSM is called:")
+        print("   see docs/modern-standby-fn-keys.md for the fix.")
+    print("   A power cycle is needed before testing again.")
+    return 1
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "check"
+    require_root()
+    if cmd == "check":
+        return cmd_check()
+    if cmd == "trial":
+        secs = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
+        return cmd_trial(secs)
+    if cmd == "ladder":
+        return cmd_ladder()
+    sys.exit(__doc__)
+
+
+sys.exit(main())
