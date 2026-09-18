@@ -591,8 +591,11 @@ class LayoutPanel(QWidget):
         spec = self.spec()
         if not spec or not spec.get("zones"):
             return
+        # A stand-in for the default look, not an alert: it must not wake a
+        # surface the idle dim has put down.
         self._send({"cmd": "play", "spec": spec, "key": self.LIVE_KEY,
-                    "target": "both", "priority": 0, "hold": True, "timeout": 0})
+                    "target": "both", "priority": 0, "hold": True, "timeout": 0,
+                    "stand_in": True})
 
     def save(self) -> None:
         reply = self._send({"cmd": "config", "action": "save_layouts",

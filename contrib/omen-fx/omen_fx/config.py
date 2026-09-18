@@ -20,8 +20,9 @@ BASE_PATH = os.environ.get("OMEN_FX_BASE", "/etc/omen-fx/base.toml")
 # Zone layouts, likewise written by the GUI: a named, ordered stack of zones
 # that any effect or default profile can refer to by name.
 LAYOUTS_PATH = os.environ.get("OMEN_FX_LAYOUTS", "/etc/omen-fx/layouts.toml")
-# Machine-wide switches the GUI can flip -- idle dimming, so far. Same split as
-# the others: config.toml stays hand-written, this file is the program's.
+# Machine-wide switches the GUI can flip -- idle dimming, per power source.
+# Same split as the others: config.toml stays hand-written, this file is the
+# program's.
 SETTINGS_PATH = os.environ.get("OMEN_FX_SETTINGS", "/etc/omen-fx/settings.toml")
 SOCKET_PATH = os.environ.get("OMEN_FX_SOCKET", "/run/omen-fx/control.sock")
 
@@ -55,11 +56,19 @@ DEFAULTS = {
     # a *rendering* level, not the user's brightness: the desktop's slider is
     # left exactly where its owner put it, so nothing goes stale and the
     # machine wakes back to the level it was set to.
+    #
+    # These are the values for both power sources. [idle.ac] and
+    # [idle.battery] may each override any of them, so the machine can go
+    # dark on battery and merely dim at the desk; see Config.idle_for.
     "idle": {
         "enabled": False,
         "timeout": 60,      # seconds of no input before dimming
         "brightness": 20,   # percent of the normal level once dimmed
         "fade_ms": 1500,    # how long the dim takes; waking up is immediate
+        # Lift the dim on a surface while an alert plays on it, then dim
+        # again. The user's own level still applies, so a slider at zero
+        # stays dark whatever arrives.
+        "wake_for_alerts": False,
     },
     "effects": {},
     "layouts": {},
@@ -121,6 +130,9 @@ class Config:
             data = {**data, "base": merged_base}
         idle_overlay = cls._load_table(SETTINGS_PATH, "idle")
         if idle_overlay:
+            # The GUI writes [idle.ac] and [idle.battery]; an older file has
+            # flat keys. Either way the file wins over config.toml key by key,
+            # sub-tables included, and a flat key it sets applies to both.
             merged_idle = dict(data.get("idle", {}) or {})
             merged_idle.update(idle_overlay)
             data = {**data, "idle": merged_idle}
@@ -164,6 +176,18 @@ class Config:
         if isinstance(spec, dict) and spec:
             return self.expand(dict(spec))
         return None
+
+    def idle_for(self, on_battery: bool) -> dict:
+        """The idle-dim settings in force on one power source.
+
+        Three layers: the built-in defaults, the flat keys of ``[idle]`` (which
+        apply to both, and are all an older settings file has), then
+        ``[idle.battery]`` or ``[idle.ac]`` on top.
+        """
+        flat = {k: v for k, v in self.idle.items() if not isinstance(v, dict)}
+        specific = self.idle.get("battery" if on_battery else "ac")
+        return {**DEFAULTS["idle"], **flat,
+                **(specific if isinstance(specific, dict) else {})}
 
     @classmethod
     def _load_base_overlay(cls) -> dict:

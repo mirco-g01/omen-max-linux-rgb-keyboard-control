@@ -285,16 +285,57 @@ the OSD), else UPower, else the sysfs LED. That order matters: writing the LED
 while UPower is running leaves the desktop's slider showing a value the
 hardware no longer has.
 
+### F4, and why the daemon keeps the MCU lit
+
+F4 (the keyboard-backlight key) never reaches the host: the keyboard's own
+microcontroller handles it, stepping its lighting level 100% → 60% → off and
+round again. While the daemon holds the LampArray the keys ignore that level
+— they show whatever is painted — but **the light bar does not**: it goes
+dark, and stays dark under every effect, because the level lives in the MCU's
+flash and survives reboots and full power cycles. One accidental press is
+enough, and from Linux nothing looks wrong: the driver writes colours, the EC
+accepts them, and the bar shows nothing.
+
+So the daemon reads that level over the keyboard's vendor interface (the same
+frames OMEN Gaming Hub uses) when it takes the LampArray, and every few seconds
+afterwards, and sets it back to 100% if it has moved. Brightness is the
+desktop's slider and the idle dim, applied in software to both surfaces; F4
+simply has nothing left to do while omen-fx is running. It is logged when it
+happens:
+
+```
+omen-fxd[876]: INFO omen-fx.keys: MCU lighting level was 0%, turning it back on so the light bar follows
+```
+
 ### Dimming when you walk away
 
 Off by default; the GUI's *System* tab has the switch, the delay and how far
-to go down.
+to go down — once for when the machine is plugged in and once for battery,
+because those are different situations: at the desk a dim glow is company, on
+battery it is drain. The daemon reads the power source from
+`/sys/class/power_supply` and hears about a change through the kernel's uevent
+socket (`power.py`), so a plug going in while nobody is there still brings the
+lights to their mains level at once. In `config.toml` the flat `[idle]` keys
+apply to both, and `[idle.ac]` / `[idle.battery]` override them one at a time.
 
 It dims the *rendering*, never your level — so the slider stays where you put
 it, the desktop's idea of the brightness never goes stale, and one keypress
 brings everything straight back. Waking is instant on purpose; only the dim is
 a fade, because a keyboard that took a second to come back would feel like it
 was thinking about it.
+
+**Alerts wake it** lifts the dim on whichever surface an alert plays on, for
+as long as it plays, and then eases back down over the same fade. It is the
+rendering level that comes back, not your slider: a keyboard whose backlight
+you set to zero stays dark whatever arrives, because you said so.
+
+The same tab also sets the **keyboard level by power source** — 100% at the
+desk, 15% on battery, that kind of thing. That one is not the daemon's: it is
+your slider, and the desktop's power management is what already moves it when
+the plug goes in or out, so the tab writes KDE's own setting (`powerdevilrc`,
+the same thing as System Settings → Power Management → Keyboard brightness)
+and has PowerDevil reload it. Off KDE the group is greyed out, and the
+desktop's own power settings are the place to look.
 
 Inactivity comes from `/dev/input`, not from the desktop: no idle signal is
 common to KDE, GNOME, sway and a TTY, and the kernel's answer stays right when
@@ -739,6 +780,12 @@ omen-fx status
 * **idle dimming never happens** — `omen-fx status` prints `idle dim on but
   blind` when the daemon cannot read `/dev/input`. It runs as root, so this
   normally means the devices are missing, not a permission problem.
+* **the light bar is dark under every effect, the keys are fine** — F4 was
+  pressed while the daemon held the keyboard, and the MCU's own lighting level
+  went to off; see [F4, and why the daemon keeps the MCU lit](#f4-and-why-the-daemon-keeps-the-mcu-lit).
+  Since that section was written the daemon fixes it by itself; if you are on
+  an older build, press F4 until the bar comes back (with `omen-fxd` stopped
+  you can see the keyboard follow) and update.
 * **experiment without touching the hardware** — `omen-fxd --dry-run -v` logs
   every write it would make instead of making it.
 * **the keyboard stays lit while the machine sleeps** — you are running with
@@ -764,6 +811,7 @@ omen-fx status
 | `omen_fx/daemon.py` | priority queue, control socket, request vocabulary |
 | `omen_fx/config.py` | TOML config and trigger matching |
 | `omen_fx/idle.py` | seconds since the last input, read from evdev |
+| `omen_fx/power.py` | battery or mains, from sysfs, told of changes by uevent |
 | `omen_fx/notifyd.py` | D-Bus notification monitor (user session) |
 | `omen_fx/zonegui.py` | the zone editor: paintable grid, zone list, per-zone effect |
 | `omen_fx/cli.py`, `omen_fx/client.py` | `omen-fx` command line |
@@ -778,4 +826,4 @@ Config files, in increasing precedence: `/etc/omen-fx/config.toml` (yours, hand
 written, never rewritten by a program), then `/etc/omen-fx/effects.toml` (the
 GUI's alerts), `/etc/omen-fx/base.toml` (the GUI's default profiles) and
 `/etc/omen-fx/layouts.toml` (the GUI's zone layouts) and
-`/etc/omen-fx/settings.toml` (the GUI's idle-dim switches).
+`/etc/omen-fx/settings.toml` (the GUI's idle-dim switches, per power source).

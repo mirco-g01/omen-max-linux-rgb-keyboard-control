@@ -39,11 +39,15 @@ def _print(reply: dict, raw: bool) -> int:
             print("fading     " + "  ".join(f"{k}: {v} ms" for k, v in fading.items()))
         if st.get("master_brightness") is not None:
             print(f"brightness {st['master_brightness']}%  (keyboard backlight slider)")
+        if st.get("power"):
+            print(f"power      {st['power']}")
         idle = st.get("idle") or {}
         if idle:
             state = ("on" if idle.get("enabled") else "off")
             if idle.get("enabled") and not idle.get("available"):
                 state = "on but blind (cannot read /dev/input)"
+            elif idle.get("enabled") and idle.get("wake_for_alerts"):
+                state += ", alerts wake it"
             print(f"idle dim   {state}"
                   + (f"   idle for {idle['seconds']}s, at {idle['level']}%"
                      if idle.get("seconds") is not None else ""))

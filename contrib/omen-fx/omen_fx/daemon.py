@@ -32,6 +32,7 @@ from .config import (Config, CONFIG_PATH, EFFECTS_PATH, BASE_PATH,
                      LAYOUTS_PATH, SETTINGS_PATH, STATE_DIR)
 from .engine import Engine, Job, TARGETS, normalise_target
 from .idle import IdleWatcher
+from .power import PowerWatcher
 from .led import DeviceUnavailable, Snapshot
 from .surface import build_surfaces, set_bar_blend
 
@@ -81,39 +82,62 @@ def dump_base(profiles: dict) -> str:
     return "\n".join(out)
 
 
+POWER_SOURCES = ("ac", "battery")
+IDLE_KEYS = ("enabled", "timeout", "brightness", "fade_ms", "wake_for_alerts")
+
+
 def dump_settings(idle: dict) -> str:
-    out = ["# Written by omen-fx-gui: machine-wide switches.",
+    """One [idle.ac] and one [idle.battery] table; no flat keys.
+
+    Flat keys would apply to both sources and shadow whatever config.toml
+    says for one of them, and the GUI always has a full set for each anyway.
+    """
+    out = ["# Written by omen-fx-gui: machine-wide switches, per power source.",
            "# Hand-written values belong in config.toml; these win over those.",
-           "",
-           "[idle]"]
-    for key in ("enabled", "timeout", "brightness", "fade_ms"):
-        if key in idle:
-            out.append(f"{key} = {_toml_value(idle[key])}")
-    out.append("")
+           ""]
+    for source in POWER_SOURCES:
+        table = idle.get(source) or {}
+        out.append(f"[idle.{source}]")
+        for key in IDLE_KEYS:
+            if key in table:
+                out.append(f"{key} = {_toml_value(table[key])}")
+        out.append("")
     return "\n".join(out)
 
 
 def validate_settings(data) -> dict:
-    """Accept only the four idle knobs, within ranges that cannot brick a look.
+    """Accept the idle knobs for each power source, within ranges that cannot brick a look.
 
     A floor of 0 is allowed -- some people want the lights off entirely when
     they walk away -- but the timeout has a floor of five seconds, because a
     one-second timeout dims while you are reading and reads as a fault.
+
+    A flat table (no "ac"/"battery" inside) is what older GUIs send; it is
+    taken as the settings for both sources.
     """
     if not isinstance(data, dict):
         raise ValueError("settings must be a table")
+    if not any(k in data for k in POWER_SOURCES):
+        data = {source: data for source in POWER_SOURCES}
     spec = {"timeout": (5, 3600), "brightness": (0, 100), "fade_ms": (0, 30000)}
-    out: dict = {"enabled": bool(data.get("enabled", False))}
-    for key, (low, high) in spec.items():
-        if key not in data:
-            continue
-        try:
-            value = int(data[key])
-        except (TypeError, ValueError):
-            raise ValueError(f"idle.{key} must be a whole number") from None
-        if not low <= value <= high:
-            raise ValueError(f"idle.{key} must be between {low} and {high}")
-        out[key] = value
+    out: dict = {}
+    for source in POWER_SOURCES:
+        table = data.get(source)
+        if not isinstance(table, dict):
+            raise ValueError(f"idle.{source} must be a table")
+        got: dict = {"enabled": bool(table.get("enabled", False)),
+                     "wake_for_alerts": bool(table.get("wake_for_alerts", False))}
+        for key, (low, high) in spec.items():
+            if key not in table:
+                continue
+            try:
+                value = int(table[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"idle.{source}.{key} must be a whole number") from None
+            if not low <= value <= high:
+                raise ValueError(f"idle.{source}.{key} must be between {low} and {high}")
+            got[key] = value
+        out[source] = got
     return out
 
 
@@ -400,7 +424,10 @@ class Server:
         if action == "get":
             return {"ok": True, "effects": self.config.effects,
                     "settings_file": SETTINGS_PATH,
-                    "idle": dict(self.config.idle),
+                    # Resolved per source, so the GUI shows what is actually
+                    # in force rather than the layers it was built from.
+                    "idle": {"ac": self.config.idle_for(False),
+                             "battery": self.config.idle_for(True)},
                     "config": self.config.path, "effects_file": EFFECTS_PATH,
                     "base_file": BASE_PATH,
                     "base_raw": {n: dict(self.config.base.get(n) or {})
@@ -556,7 +583,8 @@ class Server:
             timeout = None
         try:
             job = Job(key, spec, priority, hold,
-                      float(timeout) if timeout else None, target=target)
+                      float(timeout) if timeout else None, target=target,
+                      stand_in=bool(req.get("stand_in", False)))
         except ValueError as exc:   # unknown effect kind
             return {"error": str(exc)}
 
@@ -604,8 +632,13 @@ def main(argv=None) -> int:
     # report the machine as freshly used and wait out a whole timeout first.
     idle_watcher = IdleWatcher()
     idle_watcher.start()
+    # The idle settings differ by power source, and a plug going in while
+    # nobody is there has to change the lights by itself.
+    power_watcher = PowerWatcher()
+    power_watcher.start()
 
-    engine = Engine(bar, keys, config, idle_watcher=idle_watcher)
+    engine = Engine(bar, keys, config, idle_watcher=idle_watcher,
+                    power_watcher=power_watcher)
     engine.start()
 
     # The keyboard stays frozen on our last frame unless the firmware gets it

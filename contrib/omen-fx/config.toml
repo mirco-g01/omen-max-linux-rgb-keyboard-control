@@ -56,13 +56,28 @@ bar_blend = 1.5
 # answer stays right when the screen is locked or a game owns the compositor.
 # Only the time of an event is taken; nothing decodes what was pressed.
 #
-# The GUI writes these to /etc/omen-fx/settings.toml (tab Sistema), which wins
+# The GUI writes these to /etc/omen-fx/settings.toml (System tab), which wins
 # over what is here.
+#
+# Plugged in and on battery are two different situations -- at the desk a dim
+# glow is company, on battery it is just drain -- so each may have its own
+# set. The keys here apply to both; [idle.ac] and [idle.battery] override
+# them one at a time. The daemon reads the power source from sysfs and
+# switches the moment the plug moves, whether or not anybody is there.
 [idle]
 enabled = false
 timeout = 60        # seconds of no keyboard or mouse before dimming
 brightness = 20     # percent of the normal level once dimmed; 0 is off
 fade_ms = 1500      # how long the dim takes. Waking up is always immediate.
+# Lift the dim on a surface while an alert plays on it, then dim again over
+# fade_ms. This is the rendering level only: the keyboard backlight slider
+# still scales everything, so a keyboard you turned off stays off.
+wake_for_alerts = false
+
+# [idle.battery]
+# brightness = 0            # dark on battery...
+# [idle.ac]
+# wake_for_alerts = true    # ...and woken by alerts at the desk
 
 [base]
 # What to go back to once an effect ends.

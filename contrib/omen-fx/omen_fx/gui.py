@@ -1306,9 +1306,11 @@ class BasePanel(QWidget):
             # the user's back and look like the lighting resetting itself.
             # Priority 0: the preview stands in for the *default* look, so every
             # alert still interrupts it, and being a hold it comes back after.
+            # stand_in says the same to the idle dim: this is not an alert, so
+            # it must not wake a dimmed surface.
             self._send({"cmd": "play", "spec": spec, "key": key,
                         "target": name, "priority": 0,
-                        "hold": True, "timeout": 0})
+                        "hold": True, "timeout": 0, "stand_in": True})
 
     def _preview(self) -> None:
         self._commit()
@@ -1344,21 +1346,165 @@ class BasePanel(QWidget):
 
 KEYS_UNIT = "omen-fx-brightnessd.service"
 
+# The desktop's per-power-source keyboard level lives in KDE's power
+# management, which is what already moves the slider when the plug goes in or
+# out. omen-fx never writes that slider itself (see led.py), so the level is
+# set where the desktop keeps it: powerdevilrc, one [Profile][Keyboard] group
+# per profile. LowBattery follows Battery -- the tab offers two cases, not
+# three, and nobody wants the keyboard *brighter* once the battery is low.
+POWERDEVIL_PROFILES = {"ac": ("AC",), "battery": ("Battery", "LowBattery")}
+POWERDEVIL_DEST = "org.kde.Solid.PowerManagement"
+POWERDEVIL_PATH = "/org/kde/Solid/PowerManagement"
+
+
+def _run(argv: list[str], timeout: float = 10) -> tuple[int, str]:
+    if not shutil.which(argv[0]):
+        return 1, f"{argv[0]} not available"
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    return done.returncode, (done.stdout + done.stderr).strip()
+
+
+def read_powerdevil_levels() -> dict | None:
+    """The keyboard level KDE applies on each power source, or None off KDE.
+
+    ``enabled`` is PowerDevil's own "use profile-specific brightness" switch:
+    with it off the desktop leaves the keyboard alone when the plug moves.
+    """
+    if not shutil.which("kreadconfig6"):
+        return None
+    out: dict = {}
+    for source, profiles in POWERDEVIL_PROFILES.items():
+        group = profiles[0]
+        code, level = _run(["kreadconfig6", "--file", "powerdevilrc",
+                            "--group", group, "--group", "Keyboard",
+                            "--key", "KeyboardBrightness", "--default", "100"])
+        if code != 0:
+            return None
+        _, use = _run(["kreadconfig6", "--file", "powerdevilrc",
+                       "--group", group, "--group", "Keyboard",
+                       "--key", "UseProfileSpecificKeyboardBrightness",
+                       "--default", "false"])
+        try:
+            out[source] = int(level)
+        except ValueError:
+            out[source] = 100
+        out.setdefault("enabled", False)
+        out["enabled"] = out["enabled"] or use.strip().lower() == "true"
+    return out
+
+
+def write_powerdevil_levels(levels: dict, enabled: bool) -> str | None:
+    """Write the levels and have PowerDevil pick them up; an error text, or None."""
+    for source, profiles in POWERDEVIL_PROFILES.items():
+        for group in profiles:
+            for key, value in (("KeyboardBrightness", str(int(levels[source]))),
+                               ("UseProfileSpecificKeyboardBrightness",
+                                "true" if enabled else "false")):
+                code, out = _run(["kwriteconfig6", "--file", "powerdevilrc",
+                                  "--group", group, "--group", "Keyboard",
+                                  "--key", key, value])
+                if code != 0:
+                    return out or f"kwriteconfig6 failed ({code})"
+    # Two calls, measured rather than assumed: reparseConfiguration only
+    # re-reads the file, and it takes loadProfile(true) to run the profile
+    # again -- which is what applies the level for the source the machine is
+    # on right now, the same as a plug going in or out would.
+    for method, args in (("reparseConfiguration", []), ("loadProfile", ["true"])):
+        code, out = _run(["gdbus", "call", "--session", "--dest", POWERDEVIL_DEST,
+                          "--object-path", POWERDEVIL_PATH,
+                          "--method", f"{POWERDEVIL_DEST}.{method}", *args])
+        if code != 0:
+            return "saved, but PowerDevil could not be told: " + (out or str(code))
+    return None
+
+
+class IdleColumn(QWidget):
+    """The idle-dim knobs for one power source."""
+
+    def __init__(self, title: str):
+        super().__init__()
+        form = QFormLayout(self)
+        form.setContentsMargins(0, 0, 0, 0)
+        heading = QLabel(f"<b>{title}</b>")
+        form.addRow(heading)
+
+        self.enabled = QCheckBox("Dim")
+        self.enabled.toggled.connect(self._toggle)
+        form.addRow(self.enabled)
+
+        self.timeout = QSpinBox()
+        self.timeout.setRange(5, 3600)
+        self.timeout.setSuffix(" s")
+        self.timeout.setSingleStep(5)
+        form.addRow("After", self.timeout)
+
+        self.brightness = QSpinBox()
+        self.brightness.setRange(0, 100)
+        self.brightness.setSuffix(" %")
+        self.brightness.setToolTip(
+            "How much light is left once dimmed. 0 turns them off.\n"
+            "It does not touch your own level: the brightness slider stays\n"
+            "where it is, and the first keypress goes straight back to it.")
+        form.addRow("Down to", self.brightness)
+
+        self.fade = QDoubleSpinBox()
+        self.fade.setRange(0.0, 30.0)
+        self.fade.setSingleStep(0.5)
+        self.fade.setDecimals(1)
+        self.fade.setSuffix(" s")
+        self.fade.setToolTip("How long the dim takes. Waking is immediate.")
+        form.addRow("Fade", self.fade)
+
+        self.wake = QCheckBox("Alerts wake it")
+        self.wake.setToolTip(
+            "While an alert plays on a dimmed surface, that surface comes\n"
+            "back to full for the alert and dims again after it.\n"
+            "Your own level still applies: with the keyboard slider at 0,\n"
+            "nothing lights up.")
+        form.addRow(self.wake)
+
+    def _toggle(self, on: bool) -> None:
+        for widget in (self.timeout, self.brightness, self.fade, self.wake):
+            widget.setEnabled(on)
+
+    def load(self, idle: dict) -> None:
+        self.enabled.setChecked(bool(idle.get("enabled")))
+        self.timeout.setValue(int(idle.get("timeout", 60)))
+        self.brightness.setValue(int(idle.get("brightness", 20)))
+        self.fade.setValue(float(idle.get("fade_ms", 1500)) / 1000.0)
+        self.wake.setChecked(bool(idle.get("wake_for_alerts")))
+        self._toggle(self.enabled.isChecked())
+
+    def values(self) -> dict:
+        return {
+            "enabled": self.enabled.isChecked(),
+            "timeout": self.timeout.value(),
+            "brightness": self.brightness.value(),
+            "fade_ms": int(round(self.fade.value() * 1000)),
+            "wake_for_alerts": self.wake.isChecked(),
+        }
+
 
 class SystemPanel(QWidget):
-    """Two machine-wide switches that are not about how the lights look.
+    """Machine-wide switches that are not about how the lights look.
 
-    The brightness-key half is a *user* service, so it is driven with
-    `systemctl --user` from here rather than through the daemon: the daemon
-    runs as root and has no business enabling things in someone's session.
-    The idle half is the daemon's, and goes over the control socket like every
-    other setting the GUI owns.
+    Three owners, three routes. The brightness-key half is a *user* service,
+    driven with `systemctl --user` from here: the daemon runs as root and has
+    no business enabling things in someone's session. The per-power-source
+    keyboard level belongs to the desktop's power management, which is what
+    moves the slider when the plug goes in or out, so it is written where KDE
+    keeps it. The idle half is the daemon's, and goes over the control socket
+    like every other setting the GUI owns.
     """
 
     def __init__(self, send):
         super().__init__()
         self._send = send
         self._loading = False
+        self._levels_known = False
 
         layout = QVBoxLayout(self)
 
@@ -1377,34 +1523,41 @@ class SystemPanel(QWidget):
         keys_column.addWidget(self.keys_note)
         layout.addWidget(keys)
 
+        level = QGroupBox("Keyboard level by power source")
+        level_column = QVBoxLayout(level)
+        self.level_enabled = QCheckBox(
+            "Set the keyboard brightness when the plug goes in or out")
+        self.level_enabled.setToolTip(
+            "This is your brightness slider, moved by the desktop's power\n"
+            "management (KDE) whenever the power source changes. Alerts and\n"
+            "the idle dim are scaled by it.")
+        self.level_enabled.toggled.connect(self._toggle_level)
+        level_column.addWidget(self.level_enabled)
+        level_row = QHBoxLayout()
+        self.level_ac = QSpinBox()
+        self.level_ac.setRange(0, 100)
+        self.level_ac.setSuffix(" %")
+        self.level_battery = QSpinBox()
+        self.level_battery.setRange(0, 100)
+        self.level_battery.setSuffix(" %")
+        level_row.addWidget(QLabel("Plugged in"))
+        level_row.addWidget(self.level_ac)
+        level_row.addSpacing(16)
+        level_row.addWidget(QLabel("On battery"))
+        level_row.addWidget(self.level_battery)
+        level_row.addStretch()
+        level_column.addLayout(level_row)
+        self.level_note = QLabel("")
+        self.level_note.setWordWrap(True)
+        level_column.addWidget(self.level_note)
+        layout.addWidget(level)
+
         idle = QGroupBox("Dim when you are away")
-        form = QFormLayout(idle)
-        self.idle_enabled = QCheckBox("On")
-        self.idle_enabled.toggled.connect(self._toggle_idle)
-        form.addRow(self.idle_enabled)
-
-        self.idle_timeout = QSpinBox()
-        self.idle_timeout.setRange(5, 3600)
-        self.idle_timeout.setSuffix(" s")
-        self.idle_timeout.setSingleStep(5)
-        form.addRow("After", self.idle_timeout)
-
-        self.idle_brightness = QSpinBox()
-        self.idle_brightness.setRange(0, 100)
-        self.idle_brightness.setSuffix(" %")
-        self.idle_brightness.setToolTip(
-            "How much light is left once dimmed. 0 turns them off.\n"
-            "It does not touch your own level: the brightness slider stays\n"
-            "where it is, and the first keypress goes straight back to it.")
-        form.addRow("Down to", self.idle_brightness)
-
-        self.idle_fade = QDoubleSpinBox()
-        self.idle_fade.setRange(0.0, 30.0)
-        self.idle_fade.setSingleStep(0.5)
-        self.idle_fade.setDecimals(1)
-        self.idle_fade.setSuffix(" s")
-        self.idle_fade.setToolTip("How long the dim takes. Waking is immediate.")
-        form.addRow("Fade", self.idle_fade)
+        columns = QHBoxLayout(idle)
+        self.idle_ac = IdleColumn("Plugged in")
+        self.idle_battery = IdleColumn("On battery")
+        columns.addWidget(self.idle_ac, 1)
+        columns.addWidget(self.idle_battery, 1)
         layout.addWidget(idle)
 
         actions = QHBoxLayout()
@@ -1412,7 +1565,7 @@ class SystemPanel(QWidget):
         self.note.setWordWrap(True)
         actions.addWidget(self.note, 1)
         self.apply_button = QPushButton("Apply")
-        self.apply_button.clicked.connect(self._save_idle)
+        self.apply_button.clicked.connect(self._apply)
         actions.addWidget(self.apply_button)
         layout.addLayout(actions)
         layout.addStretch()
@@ -1421,14 +1574,7 @@ class SystemPanel(QWidget):
 
     @staticmethod
     def _systemctl(*args: str) -> tuple[int, str]:
-        if not shutil.which("systemctl"):
-            return 1, "systemctl not available"
-        try:
-            done = subprocess.run(["systemctl", "--user", *args],
-                                  capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return 1, str(exc)
-        return done.returncode, (done.stdout + done.stderr).strip()
+        return _run(["systemctl", "--user", *args])
 
     def _load_keys(self) -> None:
         code, out = self._systemctl("is-enabled", KEYS_UNIT)
@@ -1457,35 +1603,75 @@ class SystemPanel(QWidget):
             return
         self.keys_note.setText("running" if on else "stopped")
 
-    # -- idle dimming -----------------------------------------------------
+    # -- the keyboard level per power source -----------------------------
 
-    def _toggle_idle(self, on: bool) -> None:
-        for widget in (self.idle_timeout, self.idle_brightness, self.idle_fade):
+    def _toggle_level(self, on: bool) -> None:
+        for widget in (self.level_ac, self.level_battery):
             widget.setEnabled(on)
+
+    def _load_level(self) -> None:
+        levels = read_powerdevil_levels()
+        self._levels_known = levels is not None
+        if levels is None:
+            for widget in (self.level_enabled, self.level_ac, self.level_battery):
+                widget.setEnabled(False)
+            self.level_note.setText(
+                "Needs KDE's power management (kreadconfig6 / kwriteconfig6 "
+                "not found). On another desktop, set the keyboard backlight "
+                "per power source in its own power settings.")
+            return
+        self.level_enabled.setEnabled(True)
+        self._loading = True
+        self.level_enabled.setChecked(bool(levels.get("enabled")))
+        self.level_ac.setValue(int(levels.get("ac", 100)))
+        self.level_battery.setValue(int(levels.get("battery", 100)))
+        self._loading = False
+        self._toggle_level(self.level_enabled.isChecked())
+        self.level_note.setText(
+            "Written to KDE's power management, the same setting as "
+            "System Settings → Power Management → Keyboard brightness.")
+
+    def _save_level(self) -> str | None:
+        if not self._levels_known:
+            return None
+        return write_powerdevil_levels(
+            {"ac": self.level_ac.value(), "battery": self.level_battery.value()},
+            self.level_enabled.isChecked())
+
+    # -- idle dimming -----------------------------------------------------
 
     def load(self, idle: dict, available: bool = True) -> None:
         self._loading = True
-        self.idle_enabled.setChecked(bool(idle.get("enabled")))
-        self.idle_timeout.setValue(int(idle.get("timeout", 60)))
-        self.idle_brightness.setValue(int(idle.get("brightness", 20)))
-        self.idle_fade.setValue(float(idle.get("fade_ms", 1500)) / 1000.0)
+        # The daemon answers per source; an older one answers with one flat
+        # table, which then stands for both.
+        if "ac" in idle or "battery" in idle:
+            self.idle_ac.load(idle.get("ac") or {})
+            self.idle_battery.load(idle.get("battery") or {})
+        else:
+            self.idle_ac.load(idle)
+            self.idle_battery.load(idle)
         self._loading = False
-        self._toggle_idle(self.idle_enabled.isChecked())
         if not available:
             self.note.setText(
                 "The daemon cannot read /dev/input, so it does not know when "
                 "you are away: dimming stays off.")
+        self._load_level()
         self._load_keys()
 
-    def _save_idle(self) -> None:
+    def _apply(self) -> None:
+        notes = []
         reply = self._send({"cmd": "config", "action": "save_settings", "idle": {
-            "enabled": self.idle_enabled.isChecked(),
-            "timeout": self.idle_timeout.value(),
-            "brightness": self.idle_brightness.value(),
-            "fade_ms": int(round(self.idle_fade.value() * 1000)),
+            "ac": self.idle_ac.values(),
+            "battery": self.idle_battery.values(),
         }})
         if reply:
-            self.note.setText(f"saved to {reply.get('file')}")
+            notes.append(f"saved to {reply.get('file')}")
+        error = self._save_level()
+        if error:
+            notes.append(f"keyboard level: {error}")
+        elif self._levels_known:
+            notes.append("keyboard levels saved to KDE")
+        self.note.setText("; ".join(notes))
 
 
 class MainWindow(QMainWindow):

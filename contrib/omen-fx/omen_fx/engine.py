@@ -77,13 +77,13 @@ class Job:
 
     __slots__ = ("key", "spec", "priority", "hold", "target", "deadline",
                  "cancelled", "released", "seq", "elapsed", "effect", "brightness",
-                 "last_seen")
+                 "last_seen", "stand_in")
 
     _counter = 0
 
     def __init__(self, key: str, spec: dict, priority: int, hold: bool,
                  timeout: float | None, target: str = "both",
-                 brightness: int | None = None):
+                 brightness: int | None = None, stand_in: bool = False):
         Job._counter += 1
         self.seq = Job._counter
         self.key = key
@@ -92,6 +92,12 @@ class Job:
         self.hold = hold
         self.target = target
         self.brightness = brightness
+        # A stand-in is an overlay that takes the place of the default look --
+        # the GUI's live preview -- rather than something that has happened.
+        # It is painted like any other job, but it is not an alert: it must
+        # not wake a dimmed surface, or the machine would never dim while the
+        # GUI is open.
+        self.stand_in = stand_in
         self.deadline = (time.monotonic() + timeout) if timeout else None
         self.cancelled = False
         self.released = False
@@ -137,7 +143,7 @@ class Job:
 class Engine(threading.Thread):
     daemon = True
 
-    def __init__(self, bar, keys, config, idle_watcher=None):
+    def __init__(self, bar, keys, config, idle_watcher=None, power_watcher=None):
         super().__init__(name="engine")
         self.bar = bar
         self.keys = keys
@@ -147,7 +153,17 @@ class Engine(threading.Thread):
             # So a dimmed or long-settled picture comes back the moment
             # somebody touches the machine, rather than at the next poll.
             idle_watcher.on_input = self._on_input
+        self.power_watcher = power_watcher
+        if power_watcher is not None:
+            power_watcher.on_change = self._on_power
+        # When the plug last went in or out: the desktop moves the user's
+        # level right after, and the loop watches for that as if a hand were
+        # on the slider.
+        self._power_changed = 0.0
         self._idle_level = 100.0
+        # Per surface, when an alert was last seen on it while dimmed, so
+        # the dim can ease back once the alert has gone. See _surface_idle.
+        self._alert_seen: dict[str, float | None] = {"bar": None, "keys": None}
         # Set while the loop is sleeping the long interval, which is the only
         # time an input event has anything to tell it.
         self._dormant = False
@@ -238,8 +254,12 @@ class Engine(threading.Thread):
                 "fast_write": self.bar.available and self.bar.bar.has_zones,
                 # The user's keyboard-backlight slider, which scales both.
                 "master_brightness": self.keys.master,
+                "power": ("battery" if self._on_battery() else "mains"
+                          if self.power_watcher and self.power_watcher.known
+                          else None),
                 "idle": {
-                    "enabled": bool(self.config.idle.get("enabled")),
+                    "enabled": bool(self._idle_settings().get("enabled")),
+                    "wake_for_alerts": bool(self._idle_settings().get("wake_for_alerts")),
                     "available": bool(self.idle_watcher and self.idle_watcher.available),
                     "seconds": (round(self.idle_watcher.seconds, 1)
                                 if self.idle_watcher else None),
@@ -400,12 +420,16 @@ class Engine(threading.Thread):
         self.keys.set_master(master)
         self.bar.set_master(master)
         dimming = self._update_idle()
-        self.keys.set_idle(self._idle_level)
-        self.bar.set_idle(self._idle_level)
         with self.cv:
             self.jobs = [j for j in self.jobs if not j.done]
             chosen = {name: self._pick(name) for name in ("bar", "keys")}
             self._active = dict(chosen)
+            # The dim is one number for the machine, but an alert may lift it
+            # on the surface it plays on, so each surface gets its own.
+            for name, surface in (("bar", self.bar), ("keys", self.keys)):
+                level, moving = self._surface_idle(name, chosen[name], now)
+                surface.set_idle(level)
+                dimming = dimming or moving
             live = {id(j) for j in chosen.values() if j}
             # Only the jobs actually on screen age, so a queued notification
             # waits its turn instead of expiring unseen behind a held effect.
@@ -485,8 +509,12 @@ class Engine(threading.Thread):
         watcher = self.idle_watcher
         if watcher is not None and watcher.available:
             quiet = watcher.seconds
-            present = quiet < PRESENCE_S
-            settings = self.config.idle
+            # A plug going in or out counts as a hand on the slider: the
+            # desktop moves the user's level a moment later, and that has to
+            # be picked up whether or not anybody is there.
+            present = (quiet < PRESENCE_S
+                       or now - self._power_changed < PRESENCE_S)
+            settings = self._idle_settings()
             if settings.get("enabled") and self._idle_level >= 100.0:
                 timeout = max(1.0, float(settings.get("timeout", 60)))
                 if quiet < timeout:
@@ -514,6 +542,57 @@ class Engine(threading.Thread):
         with self.cv:
             self._wake()
 
+    def _on_power(self, on_battery: bool) -> None:
+        """The plug went in or out; called from the power watch's thread.
+
+        Two things follow from it. The idle settings in force may be a
+        different set now -- a machine dark on battery has to light up to its
+        mains level the moment the plug goes in, with nobody touching it --
+        and the desktop is about to move the user's slider to its level for
+        the new source, which the loop must not sleep through.
+        """
+        with self.cv:
+            self._power_changed = time.monotonic()
+            self._wake()
+
+    def _on_battery(self) -> bool:
+        watcher = self.power_watcher
+        return bool(watcher is not None and watcher.on_battery)
+
+    def _idle_settings(self) -> dict:
+        return self.config.idle_for(self._on_battery())
+
+    def _surface_idle(self, name: str, job: Job | None, now: float) -> tuple[float, bool]:
+        """The idle level for one surface: the machine's, unless an alert lifts it.
+
+        With ``wake_for_alerts`` on, a surface an alert is playing on renders
+        at full while the alert lasts, and then eases back down to the dim over
+        the same fade the dim itself uses -- a snap back to dark the instant
+        the alert ends would read as the lights failing. Returns the level and
+        whether it is still on its way somewhere.
+
+        "Full" here is the *rendering* level; the user's own slider still
+        multiplies everything, so a keyboard whose level is zero stays dark
+        whatever arrives -- somebody who turned the lights off has said so.
+        """
+        level = self._idle_level
+        settings = self._idle_settings()
+        if level >= 100.0 or not settings.get("wake_for_alerts"):
+            self._alert_seen[name] = None
+            return level, False
+        if job is not None and not job.stand_in:
+            self._alert_seen[name] = now
+            return 100.0, False
+        seen = self._alert_seen[name]
+        if seen is None:
+            return level, False
+        fade = max(0.0, float(settings.get("fade_ms", 1500))) / 1000.0
+        progress = 1.0 if fade <= 0 else min(1.0, (now - seen) / fade)
+        if progress >= 1.0:
+            self._alert_seen[name] = None
+            return level, False
+        return 100.0 - (100.0 - level) * progress, True
+
     def _update_idle(self) -> bool:
         """Where the idle dim has got to, from the seconds since the last input.
 
@@ -527,7 +606,7 @@ class Engine(threading.Thread):
         is no state to get out of step -- one keypress and the whole thing is
         back at full, whatever it was in the middle of.
         """
-        settings = self.config.idle
+        settings = self._idle_settings()
         watcher = self.idle_watcher
         if not settings.get("enabled") or watcher is None or not watcher.available:
             self._idle_level = 100.0
